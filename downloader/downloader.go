@@ -7,6 +7,7 @@ import (
 	"bit-client/torrent"
 	"bit-client/tracker"
 	"bytes"
+	"crypto/sha1"
 	"fmt"
 	"log"
 	"net"
@@ -16,7 +17,7 @@ import (
 type Downloader struct {
 	Conn        net.Conn
 	Peers       []peer.Peer
-	PieceHash   [][]byte
+	PieceHash   [][20]byte
 	Infohash    [20]byte
 	BitField    message.Bitfield
 	PieceLength int
@@ -42,20 +43,21 @@ func New(t *torrent.Torrent) *Downloader {
 
 func (d *Downloader) Download(fileName string) {
 	var download bytes.Buffer
+	var err error
 	curr := 1
 	for _, p := range d.Peers {
-		conn, err := peer.ConnectToPeer(p)
-		d.Conn = conn
-		if err != nil {
-			continue
-		}
-		_, err = handshake.New(d.Infohash).DoHandshake(d.Conn)
-		if err != nil {
-			continue
-		}
 		for i := curr; i < len(d.PieceHash); i++ {
-			piece, _ := d.downloadPiece(i)
-			if piece == nil {
+			curr = i
+			d.Conn, err = peer.ConnectToPeer(p)
+			if err != nil {
+				break
+			}
+			_, err := handshake.New(d.Infohash).DoHandshake(d.Conn)
+			if err != nil {
+				continue
+			}
+			piece, err := d.downloadPiece(i)
+			if piece == nil || err != nil {
 				i--
 				continue
 			}
@@ -105,6 +107,9 @@ func (d *Downloader) waitForPiece() (*message.Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	if msg == nil {
+		return d.waitForPiece()
+	}
 	if msg.ID == message.MsgChoke {
 		return nil, fmt.Errorf("peer sent choke")
 	}
@@ -114,20 +119,35 @@ func (d *Downloader) waitForPiece() (*message.Message, error) {
 	return msg, nil
 }
 
-func (d *Downloader) downloadBlocks(index int) (bytes.Buffer, error) {
+func (d *Downloader) downloadBlocks(index int) ([]byte, error) {
+	fmt.Print("\033[H\033[2J")
+	fmt.Printf("Trying to download %d piece out of %d\n", index, len(d.PieceHash))
 	blockSize, pieceSize := 16384, d.PieceLength
 	var payload bytes.Buffer
-	for i := 0; i < pieceSize; i += blockSize {
-		fmt.Printf("Downloading %d piece", index)
+	var i int
+	for i = 0; i < pieceSize; i += (blockSize) {
 		d.sendRequest(index, i, 16384)
+		msg, err := d.waitForPiece()
+		if err != nil || msg == nil {
+			return nil, fmt.Errorf("unable to read piece")
+		}
+		payload.Write(msg.Payload)
+	}
+	if (i - pieceSize) != 0 {
+		d.sendRequest(index, i, i-pieceSize)
 		msg, _ := d.waitForPiece()
 		payload.Write(msg.Payload)
 	}
-	return payload, nil
+	// fmt.Printf("Completed downloading %d piece out of %d\n", index, len(d.PieceHash))
+	hash := sha1.Sum(payload.Bytes())
+	if bytes.Equal(hash[:], payload.Bytes()) {
+		return nil, fmt.Errorf("integrity check failed")
+	}
+	return payload.Bytes(), nil
 }
 
 func (d *Downloader) downloadPiece(index int) ([]byte, error) {
-	var payload bytes.Buffer
+	var payload []byte
 
 	err := d.readBitfield()
 	if err != nil {
@@ -152,5 +172,5 @@ func (d *Downloader) downloadPiece(index int) ([]byte, error) {
 		return nil, fmt.Errorf("peer doesn't have piece")
 	}
 	defer d.Conn.Close()
-	return payload.Bytes(), nil
+	return payload, nil
 }

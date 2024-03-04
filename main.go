@@ -10,7 +10,7 @@ import (
 
 func main() {
 	torrentPath := flag.String("in", "./.nocode/sample.torrent", "torrent file")
-	//outputPath := flag.String("out", "./", "output path")
+	outputPath := flag.String("out", "./", "output path")
 
 	reader, _ := os.Open(*torrentPath)
 
@@ -19,5 +19,5 @@ func main() {
 		log.Fatal("Invalid torrent file.", err)
 	}
 	d := downloader.New(t)
-	d.Download()
+	d.Download(*outputPath)
 }

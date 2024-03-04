@@ -3,10 +3,10 @@ package torrent
 import (
 	"bytes"
 	"crypto/sha1"
+	"fmt"
 	"io"
 	"net/url"
 	"strconv"
-	"strings"
 
 	"github.com/jackpal/bencode-go"
 )
@@ -29,7 +29,7 @@ type Torrent struct {
 type TorrentFile struct {
 	Announce     string
 	InfoHash     [20]byte
-	PiecesHash   [][]byte
+	PiecesHash   [][20]byte
 	PiecesLength int
 	Length       int
 	Name         string
@@ -37,14 +37,12 @@ type TorrentFile struct {
 
 // ToTorrentFile convert Torrent to TorrentFile struct
 func (t *Torrent) ToTorrenFile() (*TorrentFile, error) {
-	pieces := strings.Split(t.Info.Pieces, " ")
-	b := make([][]byte, 0)
-	for _, v := range pieces {
-		b = append(b, []byte(v))
+	b, err := t.Info.splitPieceHashes()
+	if err != nil {
+		return nil, err
 	}
-
 	var buf bytes.Buffer
-	err := bencode.Marshal(&buf, t.Info)
+	err = bencode.Marshal(&buf, t.Info)
 	if err != nil {
 		return nil, err
 	}
@@ -57,6 +55,22 @@ func (t *Torrent) ToTorrenFile() (*TorrentFile, error) {
 		Name:         t.Info.Name,
 		PiecesLength: t.Info.PieceLength,
 	}, nil
+}
+
+func (i Info) splitPieceHashes() ([][20]byte, error) {
+	hashLen := 20 // Length of SHA-1 hash
+	buf := []byte(i.Pieces)
+	if len(buf)%hashLen != 0 {
+		err := fmt.Errorf("Received malformed pieces of length %d", len(buf))
+		return nil, err
+	}
+	numHashes := len(buf) / hashLen
+	hashes := make([][20]byte, numHashes)
+
+	for i := 0; i < numHashes; i++ {
+		copy(hashes[i][:], buf[i*hashLen:(i+1)*hashLen])
+	}
+	return hashes, nil
 }
 
 // Read reads torrent file and returns Torrent instance.
