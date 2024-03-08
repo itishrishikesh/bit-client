@@ -19,8 +19,12 @@ type Downloader struct {
 	Peers       []peer.Peer
 	PieceHash   [][20]byte
 	Infohash    [20]byte
-	BitField    message.Bitfield
 	PieceLength int
+}
+
+type Connection struct {
+	Conn     net.Conn
+	BitField message.Bitfield
 }
 
 func New(t *torrent.Torrent) *Downloader {
@@ -43,31 +47,67 @@ func New(t *torrent.Torrent) *Downloader {
 
 func (d *Downloader) Download(fileName string) {
 	var download bytes.Buffer
-	var err error
-	curr := 1
-	for _, p := range d.Peers {
-		for i := curr; i < len(d.PieceHash); i++ {
-			curr = i
-			d.Conn, err = peer.ConnectToPeer(p)
+	downloadedPieces := make([][]byte, len(d.PieceHash))
+	queue := make(chan int, len(d.PieceHash))
+	for i := 0; i < len(d.PieceHash); i++ {
+		queue <- i
+	}
+	for len(queue) > 0 {
+		for _, p := range d.Peers {
+			curr := <-queue
+			c, err := peer.ConnectToPeer(p)
 			if err != nil {
+				queue <- curr
 				break
 			}
-			_, err := handshake.New(d.Infohash).DoHandshake(d.Conn)
+			_, err = handshake.New(d.Infohash).DoHandshake(c)
 			if err != nil {
+				queue <- curr
 				continue
 			}
-			piece, err := d.downloadPiece(i)
-			if piece == nil || err != nil {
-				i--
-				continue
-			}
-			download.Write(piece)
+			go func() {
+				b, err := d.downloadPiece(curr, &Connection{Conn: c})
+				if err != nil {
+					queue <- curr
+					return
+				}
+				downloadedPieces[curr] = b
+			}()
 		}
+	}
+	for _, b := range downloadedPieces {
+		download.Write(b)
 	}
 	os.WriteFile(fileName, download.Bytes(), 0644)
 }
 
-func (d *Downloader) readBitfield() error {
+// func (d *Downloader) Download(fileName string) {
+// 	var download bytes.Buffer
+// 	var err error
+// 	curr := 1
+// 	for _, p := range d.Peers {
+// 		for i := curr; i < len(d.PieceHash); i++ {
+// 			curr = i
+// 			d.Conn, err = peer.ConnectToPeer(p)
+// 			if err != nil {
+// 				break
+// 			}
+// 			_, err := handshake.New(d.Infohash).DoHandshake(d.Conn)
+// 			if err != nil {
+// 				continue
+// 			}
+// 			piece, err := d.downloadPiece(i)
+// 			if piece == nil || err != nil {
+// 				i--
+// 				continue
+// 			}
+// 			download.Write(piece)
+// 		}
+// 	}
+// 	os.WriteFile(fileName, download.Bytes(), 0644)
+// }
+
+func (d *Connection) readBitfield() error {
 	msg, err := message.ReadMessage(d.Conn)
 	if err != nil {
 		return err
@@ -76,7 +116,7 @@ func (d *Downloader) readBitfield() error {
 	return nil
 }
 
-func (d *Downloader) sendUnchokeAndInterested() error {
+func (d *Connection) sendUnchokeAndInterested() error {
 	_, err := d.Conn.Write(message.New(message.MsgUnchoke))
 	if err != nil {
 		return err
@@ -88,7 +128,7 @@ func (d *Downloader) sendUnchokeAndInterested() error {
 	return nil
 }
 
-func (d *Downloader) waitForUnchoke() error {
+func (d *Connection) waitForUnchoke() error {
 	unchoke, err := message.ReadMessage(d.Conn)
 	if unchoke.ID != message.MsgUnchoke {
 		return fmt.Errorf("expected unchoke but received %d", unchoke.ID)
@@ -96,13 +136,13 @@ func (d *Downloader) waitForUnchoke() error {
 	return err
 }
 
-func (d *Downloader) sendRequest(index, begin, length int) error {
+func (d *Connection) sendRequest(index, begin, length int) error {
 	request := message.FormatRequest(index, begin, length)
 	_, err := d.Conn.Write(request.Serialize())
 	return err
 }
 
-func (d *Downloader) waitForPiece() (*message.Message, error) {
+func (d *Connection) waitForPiece() (*message.Message, error) {
 	msg, err := message.ReadMessage(d.Conn)
 	if err != nil {
 		return nil, err
@@ -119,10 +159,8 @@ func (d *Downloader) waitForPiece() (*message.Message, error) {
 	return msg, nil
 }
 
-func (d *Downloader) downloadBlocks(index int) ([]byte, error) {
-	fmt.Print("\033[H\033[2J")
-	fmt.Printf("Trying to download %d piece out of %d\n", index, len(d.PieceHash))
-	blockSize, pieceSize := 16384, d.PieceLength
+func (d *Connection) downloadBlocks(index, lenPieces, size int) ([]byte, error) {
+	blockSize, pieceSize := 16384, size
 	var payload bytes.Buffer
 	var i int
 	for i = 0; i < pieceSize; i += (blockSize) {
@@ -143,34 +181,35 @@ func (d *Downloader) downloadBlocks(index int) ([]byte, error) {
 	if bytes.Equal(hash[:], payload.Bytes()) {
 		return nil, fmt.Errorf("integrity check failed")
 	}
+	fmt.Printf("Downloaded %d piece out of %d\n", index, lenPieces)
 	return payload.Bytes(), nil
 }
 
-func (d *Downloader) downloadPiece(index int) ([]byte, error) {
+func (d *Downloader) downloadPiece(index int, conn *Connection) ([]byte, error) {
 	var payload []byte
 
-	err := d.readBitfield()
+	err := conn.readBitfield()
 	if err != nil {
 		return nil, err
 	}
 
-	err = d.sendUnchokeAndInterested()
+	err = conn.sendUnchokeAndInterested()
 	if err != nil {
 		return nil, err
 	}
 
-	if d.BitField.HasPiece(index) {
-		err := d.waitForUnchoke()
+	if conn.BitField.HasPiece(index) {
+		err := conn.waitForUnchoke()
 		if err != nil {
 			return nil, err
 		}
-		payload, err = d.downloadBlocks(index)
+		payload, err = conn.downloadBlocks(index, len(d.PieceHash), d.PieceLength)
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		return nil, fmt.Errorf("peer doesn't have piece")
 	}
-	defer d.Conn.Close()
+	defer conn.Conn.Close()
 	return payload, nil
 }
