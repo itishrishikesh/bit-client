@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"time"
 )
 
 type Downloader struct {
@@ -20,11 +21,13 @@ type Downloader struct {
 	PieceHash   [][20]byte
 	Infohash    [20]byte
 	PieceLength int
+	Length      int
 }
 
 type Connection struct {
-	Conn     net.Conn
-	BitField message.Bitfield
+	Conn      net.Conn
+	BitField  message.Bitfield
+	PieceHash [][20]byte
 }
 
 func New(t *torrent.Torrent) *Downloader {
@@ -42,6 +45,7 @@ func New(t *torrent.Torrent) *Downloader {
 		PieceHash:   file.PiecesHash,
 		Infohash:    file.InfoHash,
 		PieceLength: file.PiecesLength,
+		Length:      file.Length,
 	}
 }
 
@@ -49,30 +53,40 @@ func (d *Downloader) Download(fileName string) {
 	var download bytes.Buffer
 	downloadedPieces := make([][]byte, len(d.PieceHash))
 	queue := make(chan int, len(d.PieceHash))
+	var counter int
 	for i := 0; i < len(d.PieceHash); i++ {
 		queue <- i
 	}
-	for len(queue) > 0 {
-		for _, p := range d.Peers {
+	for counter != len(d.PieceHash) {
+		for index, p := range d.Peers {
 			curr := <-queue
-			c, err := peer.ConnectToPeer(p)
-			if err != nil {
-				queue <- curr
-				break
-			}
-			_, err = handshake.New(d.Infohash).DoHandshake(c)
-			if err != nil {
-				queue <- curr
-				continue
-			}
-			go func() {
-				b, err := d.downloadPiece(curr, &Connection{Conn: c})
+			fmt.Print("\033[H\033[2J")
+			fmt.Printf("Trying to download %d piece, with peer %d\n", curr, index)
+			fmt.Printf("Downloaded pieces %d out of %d", counter, len(d.PieceHash))
+			go func(p peer.Peer, index int) {
+				c, err := peer.ConnectToPeer(p)
 				if err != nil {
+					// fmt.Printf("Failed to download %d piece, with peer %d: %v\n", curr, index, err)
 					queue <- curr
 					return
 				}
+				_, err = handshake.New(d.Infohash).DoHandshake(c)
+				if err != nil {
+					// fmt.Printf("Failed to download %d piece, with peer %d: %v\n", curr, index, err)
+					queue <- curr
+					return
+				}
+				c.SetDeadline(time.Time{})
+				b, err := d.downloadPiece(curr, &Connection{Conn: c, PieceHash: d.PieceHash})
+				if err != nil {
+					// fmt.Printf("Failed to download %d piece, with peer %d: %v\n", curr, index, err)
+					queue <- curr
+					return
+				}
+				counter++
 				downloadedPieces[curr] = b
-			}()
+				c.Write(message.FormatHave(curr).Serialize())
+			}(p, index)
 		}
 	}
 	for _, b := range downloadedPieces {
@@ -80,32 +94,6 @@ func (d *Downloader) Download(fileName string) {
 	}
 	os.WriteFile(fileName, download.Bytes(), 0644)
 }
-
-// func (d *Downloader) Download(fileName string) {
-// 	var download bytes.Buffer
-// 	var err error
-// 	curr := 1
-// 	for _, p := range d.Peers {
-// 		for i := curr; i < len(d.PieceHash); i++ {
-// 			curr = i
-// 			d.Conn, err = peer.ConnectToPeer(p)
-// 			if err != nil {
-// 				break
-// 			}
-// 			_, err := handshake.New(d.Infohash).DoHandshake(d.Conn)
-// 			if err != nil {
-// 				continue
-// 			}
-// 			piece, err := d.downloadPiece(i)
-// 			if piece == nil || err != nil {
-// 				i--
-// 				continue
-// 			}
-// 			download.Write(piece)
-// 		}
-// 	}
-// 	os.WriteFile(fileName, download.Bytes(), 0644)
-// }
 
 func (d *Connection) readBitfield() error {
 	msg, err := message.ReadMessage(d.Conn)
@@ -130,10 +118,16 @@ func (d *Connection) sendUnchokeAndInterested() error {
 
 func (d *Connection) waitForUnchoke() error {
 	unchoke, err := message.ReadMessage(d.Conn)
+	if err != nil {
+		return err
+	}
+	if unchoke == nil {
+		return fmt.Errorf("keep alive message received instead of unchoke")
+	}
 	if unchoke.ID != message.MsgUnchoke {
 		return fmt.Errorf("expected unchoke but received %d", unchoke.ID)
 	}
-	return err
+	return nil
 }
 
 func (d *Connection) sendRequest(index, begin, length int) error {
@@ -159,29 +153,36 @@ func (d *Connection) waitForPiece() (*message.Message, error) {
 	return msg, nil
 }
 
-func (d *Connection) downloadBlocks(index, lenPieces, size int) ([]byte, error) {
+func (d *Connection) downloadBlocks(index, size int) ([]byte, error) {
 	blockSize, pieceSize := 16384, size
 	var payload bytes.Buffer
 	var i int
-	for i = 0; i < pieceSize; i += (blockSize) {
+	for i = 0; (i + blockSize - 1) < pieceSize; i += (blockSize) {
 		d.sendRequest(index, i, 16384)
 		msg, err := d.waitForPiece()
-		if err != nil || msg == nil {
-			return nil, fmt.Errorf("unable to read piece")
+		if err != nil {
+			return nil, fmt.Errorf("unable to read piece block %d : %v", i, err)
 		}
-		payload.Write(msg.Payload)
+		if msg == nil {
+			return nil, fmt.Errorf("unable to read piece - keep alive message recieved")
+		}
+		payload.Write(msg.Payload[8:])
 	}
-	if (i - pieceSize) != 0 {
-		d.sendRequest(index, i, i-pieceSize)
-		msg, _ := d.waitForPiece()
-		payload.Write(msg.Payload)
+	if (pieceSize - i) != 0 {
+		d.sendRequest(index, i, pieceSize-i)
+		msg, err := d.waitForPiece()
+		if err != nil {
+			return nil, fmt.Errorf("unable to read piece block %d : %v", i, err)
+		}
+		if msg == nil {
+			return nil, fmt.Errorf("unable to read piece - keep alive message recieved")
+		}
+		payload.Write(msg.Payload[8:])
 	}
-	// fmt.Printf("Completed downloading %d piece out of %d\n", index, len(d.PieceHash))
 	hash := sha1.Sum(payload.Bytes())
-	if bytes.Equal(hash[:], payload.Bytes()) {
+	if !bytes.Equal(hash[:], d.PieceHash[index][:]) {
 		return nil, fmt.Errorf("integrity check failed")
 	}
-	fmt.Printf("Downloaded %d piece out of %d\n", index, lenPieces)
 	return payload.Bytes(), nil
 }
 
@@ -203,7 +204,7 @@ func (d *Downloader) downloadPiece(index int, conn *Connection) ([]byte, error) 
 		if err != nil {
 			return nil, err
 		}
-		payload, err = conn.downloadBlocks(index, len(d.PieceHash), d.PieceLength)
+		payload, err = conn.downloadBlocks(index, d.findPieceSize(index))
 		if err != nil {
 			return nil, err
 		}
@@ -212,4 +213,18 @@ func (d *Downloader) downloadPiece(index int, conn *Connection) ([]byte, error) 
 	}
 	defer conn.Conn.Close()
 	return payload, nil
+}
+
+func (d *Downloader) CalculateBoundsForPiece(index int) (begin int, end int) {
+	begin = index * d.PieceLength
+	end = begin + d.PieceLength
+	if end > d.Length {
+		end = d.Length
+	}
+	return begin, end
+}
+
+func (d *Downloader) findPieceSize(index int) int {
+	begin, end := d.CalculateBoundsForPiece(index)
+	return end - begin
 }
