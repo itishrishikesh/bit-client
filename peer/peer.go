@@ -32,7 +32,7 @@ func Unmarshal(bin []byte) ([]Peer, error) {
 
 // ConnectToPeer dials TCP connection to provided peer.
 func ConnectToPeer(p Peer) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", p.IP.String()+":"+strconv.Itoa(int(p.Port)), 3*time.Second)
+	conn, err := net.DialTimeout("tcp", p.IP.String()+":"+strconv.Itoa(int(p.Port)), 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
