@@ -53,41 +53,43 @@ func (d *Downloader) Download(fileName string) {
 	var download bytes.Buffer
 	downloadedPieces := make([][]byte, len(d.PieceHash))
 	queue := make(chan int, len(d.PieceHash))
-	var counter int
+	completed := make(chan int, len(d.PieceHash))
 	for i := 0; i < len(d.PieceHash); i++ {
 		queue <- i
 	}
-	for counter != len(d.PieceHash) {
-		for index, p := range d.Peers {
-			curr := <-queue
-			fmt.Print("\033[H\033[2J")
-			fmt.Printf("Trying to download %d piece, with peer %d\n", curr, index)
-			fmt.Printf("Downloaded pieces %d out of %d", counter, len(d.PieceHash))
-			go func(p peer.Peer, index int) {
-				c, err := peer.ConnectToPeer(p)
-				if err != nil {
-					// fmt.Printf("Failed to download %d piece, with peer %d: %v\n", curr, index, err)
-					queue <- curr
-					return
-				}
-				_, err = handshake.New(d.Infohash).DoHandshake(c)
-				if err != nil {
-					// fmt.Printf("Failed to download %d piece, with peer %d: %v\n", curr, index, err)
-					queue <- curr
-					return
-				}
-				c.SetDeadline(time.Time{})
-				b, err := d.downloadPiece(curr, &Connection{Conn: c, PieceHash: d.PieceHash})
-				if err != nil {
-					// fmt.Printf("Failed to download %d piece, with peer %d: %v\n", curr, index, err)
-					queue <- curr
-					return
-				}
-				counter++
-				downloadedPieces[curr] = b
-				c.Write(message.FormatHave(curr).Serialize())
-			}(p, index)
+	go func() {
+		for len(completed) < len(d.PieceHash) {
+			for index, p := range d.Peers {
+				curr := <-queue
+				go func(p peer.Peer, index int) {
+					c, err := peer.ConnectToPeer(p)
+					if err != nil {
+						queue <- curr
+						return
+					}
+					c.SetDeadline(time.Now().Add(30 * time.Second))
+					_, err = handshake.New(d.Infohash).DoHandshake(c)
+					if err != nil {
+						queue <- curr
+						return
+					}
+					b, err := d.downloadPiece(curr, &Connection{Conn: c, PieceHash: d.PieceHash})
+					if err != nil {
+						queue <- curr
+						return
+					}
+					completed <- curr
+					downloadedPieces[curr] = b
+					c.Write(message.FormatHave(curr).Serialize())
+				}(p, index)
+			}
 		}
+	}()
+	for len(completed) != len(d.PieceHash) {
+		time.Sleep(30 * time.Millisecond)
+		fmt.Print("\033[H\033[2J")
+		percetage := float64(len(completed)) / float64(len(d.PieceHash))
+		fmt.Printf("Downloading --> %0.2f%%", percetage*100)
 	}
 	for _, b := range downloadedPieces {
 		download.Write(b)
