@@ -10,7 +10,7 @@ import (
 
 func main() {
 	torrentPath := flag.String("in", "./.nocode/sample.torrent", "torrent file")
-	outputPath := flag.String("out", "./", "output path")
+	outputPath := flag.String("out", "./debian.iso", "output path")
 	reader, _ := os.Open(*torrentPath)
 	t, err := torrent.Read(reader)
 	if err != nil {
