@@ -3,7 +3,11 @@ This is a simple bit torrent client written in go, this project is written purel
 This client only works with HTTP/TCP torrents, and only works with `.torrent` files.
 
 The usage is quite simple,
-
+#### Compile
+```bash
+go build .
+```
+#### Run
 ```bash
 ./bit-client in=/path/to/any.torrent_file out=/path/to/downloaded/some.file
 ```
